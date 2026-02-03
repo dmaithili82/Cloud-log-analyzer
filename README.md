@@ -10,7 +10,7 @@ Instead of running 24/7 infrastructure, the workflow is **on-demand**:
 
 ---
 
-## ✅ What it does
+## What it does
 
 - Reads Linux/system logs from **Amazon S3**
 - Uses an AI call to classify:
