@@ -2,51 +2,39 @@ import os
 import json
 import boto3
 import urllib.request
-import re
+import urllib.error
 
-# ---------- CONFIG ----------
 BUCKET = "ai-log-analyzer-maith"
 KEY = "system.log"
-MODEL = "gpt-4o-mini"   # low cost, good for this use
-TIMEOUT_SECONDS = 20
 
-s3 = boto3.client("s3")
-
-
-# ---------- HELPERS ----------
-def fetch_logs_from_s3(bucket: str, key: str) -> str:
-    obj = s3.get_object(Bucket=bucket, Key=key)
-    return obj["Body"].read().decode("utf-8")
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+MODEL = "gpt-4o-mini"
 
 
-def call_openai_for_analysis(logs: str) -> dict:
+def call_openai_for_json(logs: str) -> dict:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise Exception("OPENAI_API_KEY is missing in Lambda environment variables")
+        raise RuntimeError("Missing OPENAI_API_KEY in Lambda environment variables")
 
-    # Ask model to return STRICT JSON only (no backticks)
-    prompt = f"""
-Return ONLY valid JSON (no markdown, no backticks, no extra text).
+    prompt = (
+        "You are a site reliability assistant. "
+        "Analyze the logs and return ONLY valid JSON with keys:\n"
+        "risk_level (low|medium|high), root_cause (string), recommended_actions (array of strings).\n\n"
+        f"LOGS:\n{logs}\n"
+    )
 
-Analyze the system logs and output JSON with keys:
-- risk_level: one of ["low","medium","high"]
-- root_cause: string
-- recommended_actions: array of strings
-
-Logs:
-{logs}
-""".strip()
-
-    url = "https://api.openai.com/v1/chat/completions"
     payload = {
         "model": MODEL,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [
+            {"role": "system", "content": "Return ONLY JSON. No markdown, no backticks."},
+            {"role": "user", "content": prompt},
+        ],
         "temperature": 0.2,
-        "max_tokens": 300
+        "max_tokens": 300,
     }
 
     req = urllib.request.Request(
-        url=url,
+        OPENAI_URL,
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
@@ -55,91 +43,81 @@ Logs:
         method="POST",
     )
 
-    with urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS) as resp:
-        body = resp.read().decode("utf-8")
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"OpenAI HTTPError {e.code}: {err_body}")
+    except Exception as e:
+        raise RuntimeError(f"OpenAI request failed: {str(e)}")
 
-    result = json.loads(body)
+    result = json.loads(raw)
     content = result["choices"][0]["message"]["content"].strip()
 
-    # Safety: if model still returns extra text, extract JSON object
-    content = content.replace("```json", "").replace("```", "").strip()
-    match = re.search(r"\{.*\}", content, re.DOTALL)
-    if not match:
-        raise Exception(f"AI did not return JSON. Raw content: {content}")
-
-    analysis = json.loads(match.group(0))
-
-    # Normalize fields (defensive)
-    analysis.setdefault("risk_level", "medium")
-    analysis.setdefault("root_cause", "unknown")
-    analysis.setdefault("recommended_actions", [])
-
-    return analysis
+    # Parse the model output into a dict
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        # If it still returns extra text, try to salvage JSON portion
+        start = content.find("{")
+        end = content.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(content[start : end + 1])
+        raise RuntimeError(f"AI did not return valid JSON. Raw content: {content}")
 
 
 def decide_action(analysis: dict) -> dict:
-    """
-    PHASE 6: "Self-healing" action simulation.
-    We DON'T actually restart anything (no EC2). We just return what we would do.
-    """
     risk = (analysis.get("risk_level") or "").lower()
 
     if risk == "high":
-        action = {
+        return {
             "action_taken": "SIMULATED_REMEDIATION",
+            "priority": "P1",
             "what_it_would_do": [
                 "Restart nginx service",
                 "Restart mysql service",
                 "Raise incident / page on-call",
-                "Capture diagnostics (top, df, journalctl excerpts)"
+                "Capture diagnostics (top, df, journalctl excerpts)",
             ],
-            "priority": "P1"
         }
     elif risk == "medium":
-        action = {
-            "action_taken": "SIMULATED_ALERT_ONLY",
+        return {
+            "action_taken": "SIMULATED_ALERT",
+            "priority": "P2",
             "what_it_would_do": [
-                "Send alert to Slack/Email",
-                "Create ticket for investigation"
+                "Create ticket for investigation",
+                "Capture diagnostics snapshot",
+                "Monitor memory/CPU trends",
             ],
-            "priority": "P2"
         }
     else:
-        action = {
+        return {
             "action_taken": "NO_ACTION",
-            "what_it_would_do": ["Log and continue monitoring"],
-            "priority": "P3"
+            "priority": "P3",
+            "what_it_would_do": ["Continue monitoring"],
         }
 
-    return action
 
-
-# ---------- LAMBDA HANDLER ----------
 def lambda_handler(event, context):
-    # Phase 4: fetch logs
-    logs = fetch_logs_from_s3(BUCKET, KEY)
+    s3 = boto3.client("s3")
+    obj = s3.get_object(Bucket=BUCKET, Key=KEY)
+    logs = obj["Body"].read().decode("utf-8", errors="ignore").strip()
 
-    # Keep CloudWatch logs readable
-    print("===== LOGS FROM S3 =====")
-    print(logs)
+    # Print logs as ONE block (CloudWatch may still show multiple lines, but it’s one print call)
+    print("LOGS_FROM_S3=" + logs.replace("\n", "\\n"))
 
-    # Phase 5: AI analysis
-    analysis = call_openai_for_analysis(logs)
+    analysis = call_openai_for_json(logs)
+    decision = decide_action(analysis)
 
-    print("===== AI ANALYSIS (JSON) =====")
-    print(json.dumps(analysis, indent=2))
+    # Clean: print compact JSON in single lines
+    print("AI_ANALYSIS=" + json.dumps(analysis, separators=(",", ":")))
+    print("DECISION=" + json.dumps(decision, separators=(",", ":")))
 
-    # Phase 6: decision + simulated remediation
-    action = decide_action(analysis)
-
-    print("===== DECISION / ACTION =====")
-    print(json.dumps(action, indent=2))
-
-    # Clean Lambda return
     return {
         "ok": True,
         "bucket": BUCKET,
         "key": KEY,
         "analysis": analysis,
-        "decision": action
+        "decision": decision,
     }
